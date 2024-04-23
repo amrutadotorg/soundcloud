@@ -1,4 +1,8 @@
 from functools import partial
+import secrets
+import hashlib
+import base64
+
 try:
     from urllib import urlencode
 except ImportError:
@@ -45,28 +49,14 @@ class Client(object):
         elif self._options_for_token_refresh_present():
             self._refresh_token_flow()
 
-    def exchange_token(self, code):
-        """Given the value of the code parameter, request an access token."""
-        url = '%s%s/oauth2/token' % (self.scheme, self.host)
-        options = {
-            'grant_type': 'authorization_code',
-            'redirect_uri': self._redirect_uri(),
-            'client_id': self.options.get('client_id'),
-            'client_secret': self.options.get('client_secret'),
-            'code': code,
-        }
-        options.update({
-            'verify_ssl': self.options.get('verify_ssl', True),
-            'proxies': self.options.get('proxies', None)
-        })
-        self.token = wrapped_resource(
-            make_request('post', url, options))
-        self.access_token = self.token.access_token
-        return self.token
+    def _generate_code_verifier(self, length=128):
+        """Generate a code verifier for PKCE."""
+        return secrets.token_urlsafe(length)[:length]
 
-    def authorize_url(self):
-        """Return the authorization URL for OAuth2 authorization code flow."""
-        return self._authorize_url
+    def _generate_code_challenge(self, code_verifier):
+        """Generate a code challenge for PKCE."""
+        code_challenge = hashlib.sha256(code_verifier.encode()).digest()
+        return base64.urlsafe_b64encode(code_challenge).decode().replace('=', '')
 
     def _authorization_code_flow(self):
         """Build the the auth URL so the user can authorize the app."""
@@ -74,7 +64,8 @@ class Client(object):
             'scope': getattr(self, 'scope', 'non-expiring'),
             'client_id': self.options.get('client_id'),
             'response_type': 'code',
-            'redirect_uri': self._redirect_uri()
+            'redirect_uri': self._redirect_uri(),
+            'code_challenge_method': 'S256'
         }
         url = '%s%s/connect' % (self.scheme, self.host)
         self._authorize_url = '%s?%s' % (url, urlencode(options))
@@ -86,7 +77,9 @@ class Client(object):
             'grant_type': 'refresh_token',
             'client_id': self.options.get('client_id'),
             'client_secret': self.options.get('client_secret'),
-            'refresh_token': self.options.get('refresh_token')
+            'refresh_token': self.options.get('refresh_token'),
+            'code_verifier': self._generate_code_verifier(),
+            'code_challenge_method': 'S256'
         }
         options.update({
             'verify_ssl': self.options.get('verify_ssl', True),
