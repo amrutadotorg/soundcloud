@@ -2,6 +2,7 @@ from functools import partial
 import secrets
 import hashlib
 import base64
+from loguru import logger
 
 try:
     from urllib import urlencode
@@ -16,151 +17,190 @@ class Client(object):
     """A client for interacting with Soundcloud resources."""
 
     use_ssl = True
-    host = 'api.soundcloud.com'
+    host = "api.soundcloud.com"
 
     def __init__(self, **kwargs):
         """Create a client instance with the provided options. Options should
         be passed in as kwargs.
         """
-        self.use_ssl = kwargs.get('use_ssl', self.use_ssl)
-        self.host = kwargs.get('host', self.host)
-        self.scheme = self.use_ssl and 'https://' or 'http://'
+        logger.info("Initializing SoundCloud client with options: {}", kwargs)
+
+        self.use_ssl = kwargs.get("use_ssl", self.use_ssl)
+        self.host = kwargs.get("host", self.host)
+        self.scheme = self.use_ssl and "https://" or "http://"
         self.options = kwargs
         self._authorize_url = None
 
-        self.client_id = kwargs.get('client_id')
+        self.client_id = kwargs.get("client_id")
+        self.code_verifier = self._generate_code_verifier()
 
-        if 'access_token' in kwargs:
-            self.access_token = kwargs.get('access_token')
+        if "access_token" in kwargs:
+            logger.info("Access token provided. Skipping token acquisition.")
+            self.access_token = kwargs.get("access_token")
             return
 
-        if 'client_id' not in kwargs:
+        if "client_id" not in kwargs:
+            logger.error("Client initialization failed. Missing client_id.")
             raise TypeError("At least a client_id must be provided.")
 
-        if 'scope' in kwargs:
-            self.scope = kwargs.get('scope')
+        if "scope" in kwargs:
+            self.scope = kwargs.get("scope")
 
-        # decide which protocol flow to follow based on the arguments
-        # provided by the caller.
+        # Logging protocol flow decisions
         if self._options_for_authorization_code_flow_present():
+            logger.info("Using Authorization Code Flow.")
             self._authorization_code_flow()
         elif self._options_for_credentials_flow_present():
+            logger.info("Using Resource Owner Password Credentials Flow.")
             self._credentials_flow()
         elif self._options_for_token_refresh_present():
+            logger.info("Using Token Refresh Flow.")
             self._refresh_token_flow()
 
     def _generate_code_verifier(self, length=128):
         """Generate a code verifier for PKCE."""
+        logger.debug("Generating PKCE code verifier.")
         return secrets.token_urlsafe(length)[:length]
 
     def _generate_code_challenge(self, code_verifier):
         """Generate a code challenge for PKCE."""
+        logger.debug("Generating PKCE code challenge from verifier.")
         code_challenge = hashlib.sha256(code_verifier.encode()).digest()
-        return base64.urlsafe_b64encode(code_challenge).decode().replace('=', '')
+        return base64.urlsafe_b64encode(code_challenge).decode().replace("=", "")
 
     def _authorization_code_flow(self):
-        """Build the the auth URL so the user can authorize the app."""
+        """Build the auth URL so the user can authorize the app."""
+        code_challenge = self._generate_code_challenge(self.code_verifier)
+        logger.info("Building authorization URL with PKCE.")
         options = {
-            'scope': getattr(self, 'scope', 'non-expiring'),
-            'client_id': self.options.get('client_id'),
-            'response_type': 'code',
-            'redirect_uri': self._redirect_uri(),
-            'code_challenge_method': 'S256'
+            "scope": getattr(self, "scope", "non-expiring"),
+            "client_id": self.options.get("client_id"),
+            "response_type": "code",
+            "redirect_uri": self._redirect_uri(),
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
         }
-        url = '%s%s/connect' % (self.scheme, self.host)
-        self._authorize_url = '%s?%s' % (url, urlencode(options))
+        url = "%s%s/connect" % (self.scheme, self.host)
+        self._authorize_url = "%s?%s" % (url, urlencode(options))
+        logger.debug("Authorization URL: {}", self._authorize_url)
 
     def _refresh_token_flow(self):
-        """Given a refresh token, obtain a new access token."""
-        url = '%s%s/oauth2/token' % (self.scheme, self.host)
+        """Given a refresh token, obtain a new access token using PKCE."""
+        url = "%s%s/oauth2/token" % (self.scheme, self.host)
         options = {
-            'grant_type': 'refresh_token',
-            'client_id': self.options.get('client_id'),
-            'client_secret': self.options.get('client_secret'),
-            'refresh_token': self.options.get('refresh_token'),
-            'code_verifier': self._generate_code_verifier(),
-            'code_challenge_method': 'S256'
+            "grant_type": "refresh_token",
+            "client_id": self.options.get("client_id"),
+            "client_secret": self.options.get("client_secret"),
+            "refresh_token": self.options.get("refresh_token"),
+            "code_verifier": self.code_verifier,
         }
-        options.update({
-            'verify_ssl': self.options.get('verify_ssl', True),
-            'proxies': self.options.get('proxies', None)
-        })
-        self.token = wrapped_resource(
-            make_request('post', url, options))
-        self.access_token = self.token.access_token
+        options.update(
+            {
+                "verify_ssl": self.options.get("verify_ssl", True),
+                "proxies": self.options.get("proxies", None),
+            }
+        )
+        logger.info("Requesting new access token using refresh token.")
+        try:
+            self.token = wrapped_resource(make_request("post", url, options))
+            self.access_token = self.token.access_token
+            logger.info("Access token successfully refreshed.")
+        except Exception as e:
+            logger.error("Error refreshing access token: {}", e)
+            if hasattr(e, 'response'):
+                response = e.response
+                if response.status_code == 401 and "invalid_grant" in response.text:
+                    logger.error(
+                        'There was an error refreshing your access token. '
+                        'Response: {}', response.json()
+                    )
+                else:
+                    logger.error('Unexpected error during token refresh: {}', response.text)
+            raise
 
     def _credentials_flow(self):
         """Given a username and password, obtain an access token."""
-        url = '%s%s/oauth2/token' % (self.scheme, self.host)
+        url = "%s%s/oauth2/token" % (self.scheme, self.host)
         options = {
-            'client_id': self.options.get('client_id'),
-            'client_secret': self.options.get('client_secret'),
-            'username': self.options.get('username'),
-            'password': self.options.get('password'),
-            'scope': getattr(self, 'scope', ''),
-            'grant_type': 'password'
+            "client_id": self.options.get("client_id"),
+            "client_secret": self.options.get("client_secret"),
+            "username": self.options.get("username"),
+            "password": self.options.get("password"),
+            "scope": getattr(self, "scope", ""),
+            "grant_type": "password",
         }
-        options.update({
-            'verify_ssl': self.options.get('verify_ssl', True),
-            'proxies': self.options.get('proxies', None)
-        })
-        self.token = wrapped_resource(
-            make_request('post', url, options))
+        options.update(
+            {
+                "verify_ssl": self.options.get("verify_ssl", True),
+                "proxies": self.options.get("proxies", None),
+            }
+        )
+        logger.info("Requesting access token using username and password.")
+        self.token = wrapped_resource(make_request("post", url, options))
         self.access_token = self.token.access_token
+        logger.info("Access token obtained successfully.")
 
     def _request(self, method, resource, **kwargs):
         """Given an HTTP method, a resource name and kwargs, construct a
         request and return the response.
         """
         url = self._resolve_resource_name(resource)
+        logger.info("Making a {} request to {}", method.upper(), url)
 
-        if hasattr(self, 'access_token'):
+        if hasattr(self, "access_token"):
             kwargs.update(dict(oauth_token=self.access_token))
-        if hasattr(self, 'client_id'):
+        if hasattr(self, "client_id"):
             kwargs.update(dict(client_id=self.client_id))
 
-        kwargs.update({
-            'verify_ssl': self.options.get('verify_ssl', True),
-            'proxies': self.options.get('proxies', None)
-        })
-        return wrapped_resource(make_request(method, url, kwargs))
+        kwargs.update(
+            {
+                "verify_ssl": self.options.get("verify_ssl", True),
+                "proxies": self.options.get("proxies", None),
+            }
+        )
+        try:
+            response = wrapped_resource(make_request(method, url, kwargs))
+            logger.info("Request successful. Resource: {}", resource)
+            return response
+        except Exception as e:
+            logger.error("Request failed: {}", e)
+            raise
 
     def __getattr__(self, name, **kwargs):
         """Translate an HTTP verb into a request method."""
-        if name not in ('get', 'post', 'put', 'head', 'delete'):
+        if name not in ("get", "post", "put", "head", "delete"):
             raise AttributeError
         return partial(self._request, name, **kwargs)
 
     def _resolve_resource_name(self, name):
         """Convert a resource name (e.g. tracks) into a URI."""
-        if name[:4] == 'http':  # already a url
+        if name[:4] == "http":  # already a url
             return name
-        name = name.rstrip('/').lstrip('/')
-        return '%s%s/%s' % (self.scheme, self.host, name)
+        name = name.rstrip("/").lstrip("/")
+        return "%s%s/%s" % (self.scheme, self.host, name)
 
     def _redirect_uri(self):
         """
         Return the redirect uri. Checks for ``redirect_uri`` or common typo,
         ``redirect_url``
         """
-        return self.options.get(
-            'redirect_uri',
-            self.options.get('redirect_url', None))
+        return self.options.get("redirect_uri", self.options.get("redirect_url", None))
 
     # Helper functions for testing arguments provided to the constructor.
     def _options_present(self, options, kwargs):
         return all(map(lambda k: k in kwargs, options))
 
     def _options_for_credentials_flow_present(self):
-        required = ('client_id', 'client_secret', 'username', 'password')
+        required = ("client_id", "client_secret", "username", "password")
         return self._options_present(required, self.options)
 
     def _options_for_authorization_code_flow_present(self):
-        required = ('client_id', 'redirect_uri')
-        or_required = ('client_id', 'redirect_url')
-        return (self._options_present(required, self.options) or
-                self._options_present(or_required, self.options))
+        required = ("client_id", "redirect_uri")
+        or_required = ("client_id", "redirect_url")
+        return self._options_present(required, self.options) or self._options_present(
+            or_required, self.options
+        )
 
     def _options_for_token_refresh_present(self):
-        required = ('client_id', 'client_secret', 'refresh_token')
+        required = ("client_id", "client_secret", "refresh_token")
         return self._options_present(required, self.options)
